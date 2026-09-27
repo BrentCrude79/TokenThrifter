@@ -29,7 +29,7 @@ Services you don't use just show a short note instead of bars.
 ## Install
 
 ```powershell
-git clone https://github.com/<you>/TokenThrifter.git
+git clone https://github.com/BrentCrude79/TokenThrifter.git
 cd TokenThrifter
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
