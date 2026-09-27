@@ -36,6 +36,9 @@ A window whose reset time has already passed is shown as full (`reset`) — impo
   When `expiresAt` is within 5 min, the widget runs `claude -p /usage --no-session-persistence` hidden
   (at most once per 10 min; stamp file `%APPDATA%\TokenThrifter\last-reauth.txt`). `/usage` is a local slash
   command: `num_turns: 0`, zero tokens, zero cost — verified — but Claude Code refreshes the OAuth token as a side effect.
+- **Sleep/wake:** a 1 s tick arriving >60 s late means the PC slept; the widget then fetches ~20 s after wake.
+  Re-auth is skipped while no network is available, a failed re-auth (expiry didn't move) shortens the
+  cooldown to ~1 min, and a failed Claude row triggers a re-fetch after 60 s instead of 120 s.
 - **Deliberately not done:** refreshing the token directly with the refresh token. That rotates the refresh token
   and can sign out a running CLI. Let Claude Code own its credentials.
 - Note: that `claude -p` call itself fires `SessionStart`; harmless because of the mutex.

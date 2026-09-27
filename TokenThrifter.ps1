@@ -77,7 +77,8 @@ $Fetch = {
         if (-not $o) { throw 'Claude Code is not using a Claude subscription login' }
         $exp = [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$o.expiresAt)
         # Stale token: let Claude Code refresh it. "/usage" is a local command - no model call, no usage spent.
-        if ($exp -le $now.AddMinutes(5)) {
+        # Skipped while offline (e.g. just after waking from sleep) so a doomed attempt doesn't start the cooldown.
+        if ($exp -le $now.AddMinutes(5) -and [Net.NetworkInformation.NetworkInterface]::GetIsNetworkAvailable()) {
             $stampFile = Join-Path $env:APPDATA 'TokenThrifter\last-reauth.txt'
             $last = if (Test-Path $stampFile) { (Get-Item $stampFile).LastWriteTimeUtc } else { [datetime]::MinValue }
             if (([datetime]::UtcNow - $last).TotalMinutes -ge 10) {
@@ -91,6 +92,8 @@ $Fetch = {
                     if (-not $p.WaitForExit(60000)) { $p.Kill() }
                     $o = (Get-Content $credPath -Raw | ConvertFrom-Json).claudeAiOauth
                     $exp = [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$o.expiresAt)
+                    # Refresh didn't take (network still coming up?) - allow another try in ~1 min, not 10.
+                    if ($exp -le $now.AddMinutes(5)) { (Get-Item $stampFile).LastWriteTimeUtc = [datetime]::UtcNow.AddMinutes(-9) }
                 }
             }
         }
@@ -366,10 +369,17 @@ function Render($data) {
 $timer = New-Object Windows.Threading.DispatcherTimer
 $timer.Interval = [TimeSpan]::FromSeconds(1)
 $script:tick = 0
+$script:lastTick = [DateTimeOffset]::UtcNow
 $timer.Add_Tick({
+    # A long gap between 1 s ticks means the PC slept: refresh ~20 s after wake, once the network is back.
+    $nowTick = [DateTimeOffset]::UtcNow
+    if (($nowTick - $script:lastTick).TotalSeconds -gt 60) { $script:lastFetch = $nowTick.AddSeconds(20 - $RefreshSeconds) }
+    $script:lastTick = $nowTick
     if ($script:handle -and $script:handle.IsCompleted) {
         try {
             $res = $script:ps.EndInvoke($script:handle); Render $res[0]; $script:lastOk = [DateTimeOffset]::UtcNow
+            # Claude row failed (e.g. sign-in refresh pending): retry in ~1 min instead of waiting the full interval.
+            if (-not $res[0].claude.ok -and -not $Snapshot) { $script:lastFetch = [DateTimeOffset]::UtcNow.AddSeconds(60 - $RefreshSeconds) }
             if ($Snapshot) {
                 $stamp.Text = 'updated just now'
                 $win.Dispatcher.BeginInvoke([Windows.Threading.DispatcherPriority]::ContextIdle, [Action]{ Save-Snapshot; $win.Close() }) | Out-Null
