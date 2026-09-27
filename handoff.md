@@ -57,6 +57,21 @@ A window whose reset time has already passed is shown as full (`reset`) — impo
   `payload.rate_limits.primary` / `.secondary` each carry `used_percent`, `window_minutes` (300 = 5 h, 10080 = week),
   `resets_at` (epoch s). `plan_type` = plan. No network.
 
+### CPU / GPU ("In use" section)
+- `$SysFetch`, its own runspace every 5 s (`$SysSeconds`), independent of the 120 s token fetch.
+  Output: list of `@{ name; tag; load(0-100|null); mem = @{ label; used; text } | null }`.
+- One `Get-Counter` call (~1.3 s): `\Processor Information(*)\% Processor Utility` (per-socket `N,_Total`
+  instances; matches Task Manager), `\GPU Engine(*)\Utilization Percentage`, `\GPU Adapter Memory(*)\Dedicated Usage` / `Shared Usage`.
+- GPU load = busiest engine type per adapter (sum over processes per `engtype_*`, then max) — Task Manager's formula.
+- GPU counters are keyed by adapter LUID. Names come from `Get-PnpDevice -Class Display`: device property
+  `{60b193cb-5276-4d0f-96fc-f173abad3ec6} 2` (AdapterLuid). Total VRAM from the driver key's
+  `HardwareInformation.qwMemorySize` (via `DEVPKEY_Device_Driver`). > 512 MB = discrete → VRAM row;
+  otherwise it's integrated → "Shared" row against half of system RAM (Windows' shared-memory limit).
+  The adapter list is cached for the widget's lifetime in a synchronized hashtable passed into the runspace.
+- RAM from `Win32_OperatingSystem`. Microsoft Basic/Remote display adapters are skipped.
+- Counter paths are English names; on a non-English Windows `Get-Counter` finds nothing and CPU falls back
+  to `Win32_Processor.LoadPercentage` while GPU rows show `--`. Fix would be `PdhAddEnglishCounter` via P/Invoke.
+
 ## Fragile bits / ideas
 
 - Both usage endpoints are undocumented — first thing to check when a row errors.

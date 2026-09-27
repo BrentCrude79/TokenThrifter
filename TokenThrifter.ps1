@@ -10,6 +10,7 @@
     Z.ai        : GET api.z.ai/api/monitor/usage/quota/limit with your Z.ai API key
                   (ZAI_API_KEY, or the Z.ai token Claude Code is configured with).
     Codex       : the latest rate_limits event Codex CLI writes to ~/.codex/sessions (no network).
+    CPU / GPU   : Windows performance counters (load, RAM, VRAM) - refreshed every 5 s.
 
   Usage:
     powershell -NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File TokenThrifter.ps1
@@ -160,6 +161,87 @@ $Fetch = {
     $out
 }
 
+# ---------------------------------------------------------------- CPU / GPU load (off the UI thread, every few seconds)
+# Same Windows performance counters Task Manager uses, so any GPU vendor works with no extra tools.
+# GPU counters are keyed by adapter LUID; the display device's AdapterLuid property maps them to a name.
+$SysFetch = {
+    param([bool]$Demo, $Cache)
+    $ErrorActionPreference = 'Stop'
+    function Short($n) {
+        (($n -replace '\((R|TM|C)\)', '' -replace '\s+CPU\b.*', '' -replace '\s+Processor\b.*', '' -replace '\s+\d+-Core\b', '') -replace '\s{2,}', ' ').Trim()
+    }
+    function Mem($label, $used, $total) {
+        if (-not $total) { return $null }
+        @{ label = $label; used = [math]::Min(100, 100 * $used / $total); text = '{0:0.#}/{1:0}G' -f ($used / 1GB), ($total / 1GB) }
+    }
+    if ($Demo) {
+        return @(
+            @{ name = 'AMD Ryzen 9 7950X'; tag = 'CPU'; load = 23; mem = @{ label = 'RAM'; used = 41; text = '26.2/64G' } }
+            @{ name = 'NVIDIA GeForce RTX 4090'; tag = 'GPU'; load = 87; mem = @{ label = 'VRAM'; used = 72; text = '17.3/24G' } }
+        )
+    }
+
+    # Adapter list rarely changes - build it once per widget run.
+    if (-not $Cache.gpus) {
+        $gpus = @()
+        foreach ($d in Get-PnpDevice -Class Display -PresentOnly -ErrorAction SilentlyContinue) {
+            if ($d.FriendlyName -match 'Microsoft (Basic|Remote)') { continue }
+            $luid = (Get-PnpDeviceProperty -InstanceId $d.InstanceId -KeyName '{60b193cb-5276-4d0f-96fc-f173abad3ec6} 2' -ErrorAction SilentlyContinue).Data
+            $drv  = (Get-PnpDeviceProperty -InstanceId $d.InstanceId -KeyName '{a45c254e-df1c-4efd-8020-67d146a850e0} 11' -ErrorAction SilentlyContinue).Data
+            $vram = 0
+            if ($drv) {
+                $reg = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Class\$drv" -ErrorAction SilentlyContinue
+                $q = $reg.'HardwareInformation.qwMemorySize'
+                if ($q -is [byte[]]) { $q = [BitConverter]::ToUInt64(($q + (New-Object byte[] 8))[0..7], 0) }
+                if ($q) { $vram = [double]$q }
+            }
+            $gpus += @{ name = Short $d.FriendlyName; luid = [uint64]$luid; vram = $vram }
+        }
+        $Cache.gpus = $gpus
+    }
+
+    $os = Get-CimInstance Win32_OperatingSystem
+    $ramTotal = [double]$os.TotalVisibleMemorySize * 1KB
+    $ramUsed  = $ramTotal - [double]$os.FreePhysicalMemory * 1KB
+
+    $cpuLoad = @{}; $eng = @{}; $ded = @{}; $shr = @{}
+    $paths = '\Processor Information(*)\% Processor Utility', '\GPU Engine(*)\Utilization Percentage',
+             '\GPU Adapter Memory(*)\Dedicated Usage', '\GPU Adapter Memory(*)\Shared Usage'
+    foreach ($s in (Get-Counter $paths -ErrorAction SilentlyContinue).CounterSamples) {
+        $inst = $s.InstanceName; $v = $s.CookedValue
+        $luid = if ($inst -match 'luid_0x([0-9a-f]{8})_0x([0-9a-f]{8})') { [uint64]([Convert]::ToUInt64($matches[1], 16) -shl 32) + [Convert]::ToUInt64($matches[2], 16) }
+        switch (($s.Path -split '\\')[-1]) {
+            '% processor utility'    { if ($inst -match '^(\d+),_total$') { $cpuLoad[[int]$matches[1]] = $v } }
+            'utilization percentage' {
+                if ($null -ne $luid -and $inst -match 'engtype_(.+)$') {
+                    if (-not $eng[$luid]) { $eng[$luid] = @{} }
+                    $eng[$luid][$matches[1]] = [double]$eng[$luid][$matches[1]] + $v
+                }
+            }
+            'dedicated usage' { if ($null -ne $luid) { $ded[$luid] = $v } }
+            'shared usage'    { if ($null -ne $luid) { $shr[$luid] = $v } }
+        }
+    }
+
+    $out = @()
+    $cpus = @(Get-CimInstance Win32_Processor)
+    for ($i = 0; $i -lt $cpus.Count; $i++) {
+        $load = if ($cpuLoad.ContainsKey($i)) { $cpuLoad[$i] } else { $cpus[$i].LoadPercentage }
+        $out += @{ name = Short $cpus[$i].Name; tag = $(if ($cpus.Count -gt 1) { "CPU $($i + 1)" } else { 'CPU' })
+                   load = [math]::Min(100, [double]$load); mem = $(if ($i -eq 0) { Mem 'RAM' $ramUsed $ramTotal }) }
+    }
+    $n = 0
+    foreach ($g in $Cache.gpus) {
+        $n++
+        # Task Manager's GPU % = busiest engine type (3D, Copy, Video Decode, Compute ...).
+        $load = if ($eng[$g.luid]) { [math]::Min(100, ($eng[$g.luid].Values | Measure-Object -Maximum).Maximum) } else { $null }
+        # Discrete cards report dedicated VRAM; integrated ones borrow system RAM (limit = half of it).
+        $mem = if ($g.vram -gt 512MB) { Mem 'VRAM' ([double]$ded[$g.luid]) $g.vram } else { Mem 'Shared' ([double]$shr[$g.luid]) ($ramTotal / 2) }
+        $out += @{ name = $g.name; tag = $(if (@($Cache.gpus).Count -gt 1) { "GPU $n" } else { 'GPU' }); load = $load; mem = $mem }
+    }
+    $out
+}
+
 # Is Claude Code running? True for the terminal CLI and for sessions in the Claude desktop app
 # (which runs its own ...\claude-code\<version>\claude.exe). The desktop app shell alone does not count.
 function Test-ClaudeCode {
@@ -215,18 +297,20 @@ function Place($grid, $el, $col) { [Windows.Controls.Grid]::SetColumn($el, $col)
 
 $script:Countdowns = New-Object Collections.ArrayList
 
-function New-BarRow($label, $win) {
+# Load meters: fuller is worse.
+function LoadLevel($used) {
+    if ($null -eq $used) { $P.None } elseif ($used -lt 60) { $P.Good } elseif ($used -lt 85) { $P.Warn } else { $P.Bad }
+}
+
+# One labelled bar: label | bar | percent | right-hand note.
+function New-Meter($label, $fillPct, $color, $pctText, $note) {
     $g = New-Object Windows.Controls.Grid; $g.Margin = '0,7,0,0'
-    Cols $g @('38', '*', '46', '54')
+    Cols $g @('40', '*', '46', '58')
     Place $g (Text $label 11 $P.Dim) 0
-
-    $remaining = if ($win) { 100 - $win.used } else { $null }
-    $color = Level $remaining
-
     $track = New-Object Windows.Controls.Border
     $track.Height = 6; $track.CornerRadius = 3; $track.Background = Brush $P.Track; $track.VerticalAlignment = 'Center'
     $inner = New-Object Windows.Controls.Grid
-    $fillPct = if ($null -ne $remaining) { $remaining } else { 0 }
+    $fillPct = [math]::Min(100, [math]::Max(0, [double]$fillPct))
     $c1 = New-Object Windows.Controls.ColumnDefinition; $c1.Width = New-Object Windows.GridLength([math]::Max(0.001, $fillPct), 'Star')
     $c2 = New-Object Windows.Controls.ColumnDefinition; $c2.Width = New-Object Windows.GridLength([math]::Max(0.001, 100 - $fillPct), 'Star')
     [void]$inner.ColumnDefinitions.Add($c1); [void]$inner.ColumnDefinitions.Add($c2)
@@ -240,12 +324,45 @@ function New-BarRow($label, $win) {
     }
     $track.Child = $inner
     Place $g $track 1
-
-    $pct = Text $(if ($null -ne $remaining) { '{0:0}%' -f $remaining } else { '--' }) 12 $color 'SemiBold'
-    $pct.HorizontalAlignment = 'Right'
+    $pct = Text $pctText 12 $color 'SemiBold'; $pct.HorizontalAlignment = 'Right'
     Place $g $pct 2
+    $rs = Text $note 10.5 $P.Faint; $rs.HorizontalAlignment = 'Right'
+    Place $g $rs 3
+    $g
+}
 
-    $rs = Text '' 10.5 $P.Faint; $rs.HorizontalAlignment = 'Right'
+function New-UsageRow($label, $used, $note) {
+    $pct = if ($null -ne $used) { '{0:0}%' -f $used } else { '--' }
+    New-Meter $label $(if ($null -ne $used) { $used } else { 0 }) (LoadLevel $used) $pct $note
+}
+
+# Header line shared by providers and devices: status dot | name | small tag.
+function New-Header($name, $dotColor, $tag) {
+    $h = New-Object Windows.Controls.Grid
+    Cols $h @('14', '*', 'auto')
+    $dot = New-Object Windows.Shapes.Ellipse; $dot.Width = 8; $dot.Height = 8; $dot.Fill = Brush $dotColor
+    $dot.HorizontalAlignment = 'Left'
+    Place $h $dot 0
+    $n = Text $name 13 $P.Text 'SemiBold'; $n.TextTrimming = 'CharacterEllipsis'
+    Place $h $n 1
+    if ($tag) { $t = Text ([string]$tag).ToUpper() 9.5 $P.Faint 'SemiBold'; $t.Margin = '6,0,0,0'; Place $h $t 2 }
+    $h
+}
+
+function New-Device($d) {
+    $sp = New-Object Windows.Controls.StackPanel; $sp.Margin = '0,12,0,0'
+    $worst = (@($d.load, $d.mem.used) | Where-Object { $null -ne $_ } | Measure-Object -Maximum).Maximum
+    [void]$sp.Children.Add((New-Header $d.name (LoadLevel $worst) $d.tag))
+    [void]$sp.Children.Add((New-UsageRow 'Load' $d.load ''))
+    if ($d.mem) { [void]$sp.Children.Add((New-UsageRow $d.mem.label $d.mem.used $d.mem.text)) }
+    $sp
+}
+
+function New-BarRow($label, $win) {
+    $remaining = if ($win) { 100 - $win.used } else { $null }
+    $color = Level $remaining
+    $g = New-Meter $label $(if ($null -ne $remaining) { $remaining } else { 0 }) $color $(if ($null -ne $remaining) { '{0:0}%' -f $remaining } else { '--' }) ''
+    $rs = $g.Children[3]
     if ($win) {
         switch ($win.state) {
             'active' { $rs.Text = Until $win.resets; [void]$script:Countdowns.Add(@{ tb = $rs; at = $win.resets }) }
@@ -257,24 +374,15 @@ function New-BarRow($label, $win) {
         elseif ($win.state -eq 'idle') { $tip += '  -  window starts on next use' }
         $g.ToolTip = $tip
     }
-    Place $g $rs 3
     $g
 }
 
 function New-Provider($name, $d) {
     $sp = New-Object Windows.Controls.StackPanel; $sp.Margin = '0,14,0,0'
-    $h = New-Object Windows.Controls.Grid
-    Cols $h @('14', '*', 'auto')
-
     $rem = @()
     if ($d.ok) { foreach ($w in $d.five, $d.week) { if ($w) { $rem += 100 - $w.used } } }
     $worst = if ($rem.Count) { ($rem | Measure-Object -Minimum).Minimum } else { $null }
-    $dot = New-Object Windows.Shapes.Ellipse; $dot.Width = 8; $dot.Height = 8; $dot.Fill = Brush (Level $worst)
-    $dot.HorizontalAlignment = 'Left'
-    Place $h $dot 0
-    Place $h (Text $name 13 $P.Text 'SemiBold') 1
-    if ($d.plan) { Place $h (Text ([string]$d.plan).ToUpper() 9.5 $P.Faint 'SemiBold') 2 }
-    [void]$sp.Children.Add($h)
+    [void]$sp.Children.Add((New-Header $name (Level $worst) $d.plan))
 
     if ($d.ok) {
         [void]$sp.Children.Add((New-BarRow '5h' $d.five))
@@ -291,7 +399,7 @@ function New-Provider($name, $d) {
 }
 
 # ---------------------------------------------------------------- window
-$cfg = @{ Left = $null; Top = $null; Topmost = $false; CloseWithClaude = $true }
+$cfg = @{ Left = $null; Top = $null; Topmost = $false; CloseWithClaude = $true; ShowSystem = $true }
 if (Test-Path $ConfigPath) { try { (Get-Content $ConfigPath -Raw | ConvertFrom-Json).PSObject.Properties | ForEach-Object { $cfg[$_.Name] = $_.Value } } catch {} }
 function Save-Config { if ($Snapshot) { return }; New-Item -ItemType Directory -Force $ConfigDir | Out-Null; $cfg | ConvertTo-Json | Set-Content $ConfigPath -Encoding UTF8 }
 
@@ -318,6 +426,17 @@ $stamp = Text 'loading...' 10 $P.Faint; Place $head $stamp 1
 [void]$root.Children.Add($head)
 $body = New-Object Windows.Controls.StackPanel
 [void]$root.Children.Add($body)
+
+# CPU / GPU section
+$sysPanel = New-Object Windows.Controls.StackPanel; $sysPanel.Margin = '0,14,0,0'
+$rule = New-Object Windows.Controls.Border; $rule.Height = 1; $rule.Background = Brush $P.Track
+[void]$sysPanel.Children.Add($rule)
+$sysTitle = Text 'IN USE' 10 $P.Dim 'SemiBold'; $sysTitle.Margin = '0,12,0,0'
+[void]$sysPanel.Children.Add($sysTitle)
+$sysBody = New-Object Windows.Controls.StackPanel
+[void]$sysPanel.Children.Add($sysBody)
+$sysPanel.Visibility = if ($cfg.ShowSystem) { 'Visible' } else { 'Collapsed' }
+[void]$root.Children.Add($sysPanel)
 $card.Child = $root
 $win.Content = $card
 
@@ -335,6 +454,11 @@ function Item($header, $action, [switch]$Check, $checked) {
 [void](Item 'Refresh now' { Start-Fetch })
 [void](Item 'Always on top' { $win.Topmost = $this.IsChecked; $cfg.Topmost = $this.IsChecked; Save-Config } -Check ([bool]$cfg.Topmost))
 [void](Item 'Close with Claude Code' { $cfg.CloseWithClaude = $this.IsChecked; Save-Config } -Check ([bool]$cfg.CloseWithClaude))
+[void](Item 'Show CPU / GPU' {
+    $cfg.ShowSystem = $this.IsChecked; Save-Config
+    $sysPanel.Visibility = if ($cfg.ShowSystem) { 'Visible' } else { 'Collapsed' }
+    if ($cfg.ShowSystem) { Start-SysFetch }
+} -Check ([bool]$cfg.ShowSystem))
 [void]$menu.Items.Add((New-Object Windows.Controls.Separator))
 [void](Item 'Exit' { $win.Close() })
 $card.ContextMenu = $menu
@@ -366,6 +490,34 @@ function Render($data) {
     [void]$body.Children.Add((New-Provider 'ChatGPT Codex' $data.codex))
 }
 
+# CPU / GPU refresh: its own runspace so a slow counter read never delays the token rows.
+$SysSeconds = 5
+$script:sps = $null; $script:shandle = $null; $script:lastSys = [DateTimeOffset]::MinValue
+$script:sysDone = -not $cfg.ShowSystem; $script:mainDone = $false
+$SysCache = [hashtable]::Synchronized(@{})
+
+function Start-SysFetch {
+    if ($script:shandle -or -not $cfg.ShowSystem) { return }
+    $script:sps = [powershell]::Create(); [void]$script:sps.AddScript($SysFetch).AddArgument([bool]$Demo).AddArgument($SysCache)
+    $script:shandle = $script:sps.BeginInvoke(); $script:lastSys = [DateTimeOffset]::UtcNow
+}
+
+function Render-System($devs) {
+    $sysBody.Children.Clear()
+    foreach ($d in $devs) { if ($d) { [void]$sysBody.Children.Add((New-Device $d)) } }
+    if (-not $sysBody.Children.Count) {
+        $e = Text 'No CPU / GPU readings available' 10.5 $P.Dim; $e.Margin = '14,8,0,0'
+        [void]$sysBody.Children.Add($e)
+    }
+}
+
+function Save-SnapshotWhenReady {
+    if ($Snapshot -and $script:mainDone -and $script:sysDone) {
+        $stamp.Text = 'updated just now'
+        $win.Dispatcher.BeginInvoke([Windows.Threading.DispatcherPriority]::ContextIdle, [Action]{ Save-Snapshot; $win.Close() }) | Out-Null
+    }
+}
+
 $timer = New-Object Windows.Threading.DispatcherTimer
 $timer.Interval = [TimeSpan]::FromSeconds(1)
 $script:tick = 0
@@ -380,15 +532,16 @@ $timer.Add_Tick({
             $res = $script:ps.EndInvoke($script:handle); Render $res[0]; $script:lastOk = [DateTimeOffset]::UtcNow
             # Claude row failed (e.g. sign-in refresh pending): retry in ~1 min instead of waiting the full interval.
             if (-not $res[0].claude.ok -and -not $Snapshot) { $script:lastFetch = [DateTimeOffset]::UtcNow.AddSeconds(60 - $RefreshSeconds) }
-            if ($Snapshot) {
-                $stamp.Text = 'updated just now'
-                $win.Dispatcher.BeginInvoke([Windows.Threading.DispatcherPriority]::ContextIdle, [Action]{ Save-Snapshot; $win.Close() }) | Out-Null
-            }
         }
         catch { $stamp.Text = 'update failed' }
-        finally { $script:ps.Dispose(); $script:handle = $null }
+        finally { $script:ps.Dispose(); $script:handle = $null; $script:mainDone = $true; Save-SnapshotWhenReady }
+    }
+    if ($script:shandle -and $script:shandle.IsCompleted) {
+        try { Render-System @($script:sps.EndInvoke($script:shandle)) } catch {}
+        finally { $script:sps.Dispose(); $script:shandle = $null; if (-not $script:sysDone) { $script:sysDone = $true; Save-SnapshotWhenReady } }
     }
     if (([DateTimeOffset]::UtcNow - $script:lastFetch).TotalSeconds -ge $RefreshSeconds) { Start-Fetch }
+    if (-not $Snapshot -and ([DateTimeOffset]::UtcNow - $script:lastSys).TotalSeconds -ge $SysSeconds) { Start-SysFetch }
     if (($script:tick++ % 15) -eq 0) {
         foreach ($c in $script:Countdowns) { $c.tb.Text = Until $c.at }
         if (-not $script:handle -and $script:lastOk) { $stamp.Text = 'updated ' + (Ago $script:lastOk) }
@@ -400,6 +553,7 @@ $timer.Add_Tick({
 })
 
 Start-Fetch
+Start-SysFetch
 $timer.Start()
 [void]$win.ShowDialog()
 $timer.Stop()

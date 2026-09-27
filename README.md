@@ -11,6 +11,9 @@ color-coded, no browser tabs.
 - **Green** ≥ 50% left · **Amber** 20–50% · **Red** < 20%. The dot beside each service shows its tightest window.
 - The right column counts down to each window's reset. Hover a bar for the exact reset time.
 - `idle` means the window hasn't started yet (you haven't used that service since it last reset).
+- An **In use** section shows live load and memory for your CPU (with RAM) and every GPU (with VRAM, or shared
+  memory for integrated graphics), refreshed every 5 seconds. These bars are the other way round: fuller = busier
+  (green < 60%, amber < 85%, red above).
 - Starts automatically with Claude Code and closes about 45 seconds after your last Claude Code session ends.
 - Pure PowerShell + WPF — nothing to compile, nothing to `npm install`, no admin rights.
 
@@ -51,6 +54,7 @@ Restart any open Claude Code sessions so they pick up the hook.
 | Right-click → **Refresh now** | Update immediately (it refreshes every 2 minutes anyway) |
 | Right-click → **Always on top** | Keep it above other windows |
 | Right-click → **Close with Claude Code** | Untick to keep it open after Claude Code exits |
+| Right-click → **Show CPU / GPU** | Hide or show the In use section |
 | Right-click → **Exit** | Close it (it comes back with your next Claude Code session) |
 
 ## How it gets the numbers
@@ -62,6 +66,7 @@ Everything is read with credentials already on your machine; nothing is sent any
 | Claude Code | `api.anthropic.com/api/oauth/usage`, using the sign-in token Claude Code keeps in `~\.claude\.credentials.json`. When that token has gone stale, TokenThrifter quietly runs `claude -p /usage` — a local command that makes Claude Code refresh its own sign-in **without a model call or any usage**. |
 | Z.ai | `api.z.ai/api/monitor/usage/quota/limit` with your Z.ai key. |
 | Codex | The rate-limit snapshot Codex CLI writes to `~\.codex\sessions\` (no network call). It updates whenever you use Codex; if it's old, the widget says "last seen …". |
+| CPU / GPU | Windows' built-in performance counters — the same ones Task Manager uses — so NVIDIA, AMD and Intel GPUs all work with nothing extra installed. |
 
 > The Claude and Z.ai usage endpoints are the ones their own apps use; they aren't formally documented and
 > could change. If a row suddenly shows an error, that's the likely reason — issues and PRs welcome.
