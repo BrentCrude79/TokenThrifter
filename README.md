@@ -54,7 +54,9 @@ Restart any open Claude Code sessions so they pick up the hook.
 | Right-click → **Refresh now** | Update immediately (it refreshes every 2 minutes anyway) |
 | Right-click → **Always on top** | Keep it above other windows |
 | Right-click → **Close with Claude Code** | Untick to keep it open after Claude Code exits |
+| Click the **In use** section | Open Task Manager (or bring it to the front if it's already open) |
 | Right-click → **Show CPU / GPU** | Hide or show the In use section |
+| Right-click → **Hide integrated GPU** | Leave the iGPU out of the In use section |
 | Right-click → **Exit** | Close it (it comes back with your next Claude Code session) |
 
 ## How it gets the numbers

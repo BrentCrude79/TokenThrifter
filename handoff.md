@@ -69,8 +69,17 @@ A window whose reset time has already passed is shown as full (`reset`) — impo
   otherwise it's integrated → "Shared" row against half of system RAM (Windows' shared-memory limit).
   The adapter list is cached for the widget's lifetime in a synchronized hashtable passed into the runspace.
 - RAM from `Win32_OperatingSystem`. Microsoft Basic/Remote display adapters are skipped.
+- Each GPU entry carries `igpu`; `HideIGpu` (config / right-click menu) filters those out at render time.
+  GPU tags are numbered (`GPU 1`, `GPU 2`) only when more than one is shown.
 - Counter paths are English names; on a non-English Windows `Get-Counter` finds nothing and CPU falls back
   to `Win32_Processor.LoadPercentage` while GPU rows show `--`. Fix would be `PdhAddEnglishCounter` via P/Invoke.
+
+## Mouse
+
+- Left-drag moves the card by hand (`CaptureMouse` + shift `Left`/`Top` by the cursor offset, 4 px threshold)
+  using `Preview*` events. **Not** `DragMove()`: its modal loop swallows the button-up, so a click can't be told
+  from a drag. A click (no drag) on `$sysPanel` runs `Open-TaskManager` — activates the running Taskmgr or starts one.
+  Taskmgr auto-elevates, so the widget can activate it but not close it.
 
 ## Fragile bits / ideas
 

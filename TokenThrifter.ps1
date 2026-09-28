@@ -177,7 +177,7 @@ $SysFetch = {
     if ($Demo) {
         return @(
             @{ name = 'AMD Ryzen 9 7950X'; tag = 'CPU'; load = 23; mem = @{ label = 'RAM'; used = 41; text = '26.2/64G' } }
-            @{ name = 'NVIDIA GeForce RTX 4090'; tag = 'GPU'; load = 87; mem = @{ label = 'VRAM'; used = 72; text = '17.3/24G' } }
+            @{ name = 'NVIDIA GeForce RTX 4090'; tag = 'GPU'; gpu = $true; load = 87; mem = @{ label = 'VRAM'; used = 72; text = '17.3/24G' } }
         )
     }
 
@@ -230,14 +230,13 @@ $SysFetch = {
         $out += @{ name = Short $cpus[$i].Name; tag = $(if ($cpus.Count -gt 1) { "CPU $($i + 1)" } else { 'CPU' })
                    load = [math]::Min(100, [double]$load); mem = $(if ($i -eq 0) { Mem 'RAM' $ramUsed $ramTotal }) }
     }
-    $n = 0
     foreach ($g in $Cache.gpus) {
-        $n++
         # Task Manager's GPU % = busiest engine type (3D, Copy, Video Decode, Compute ...).
         $load = if ($eng[$g.luid]) { [math]::Min(100, ($eng[$g.luid].Values | Measure-Object -Maximum).Maximum) } else { $null }
         # Discrete cards report dedicated VRAM; integrated ones borrow system RAM (limit = half of it).
-        $mem = if ($g.vram -gt 512MB) { Mem 'VRAM' ([double]$ded[$g.luid]) $g.vram } else { Mem 'Shared' ([double]$shr[$g.luid]) ($ramTotal / 2) }
-        $out += @{ name = $g.name; tag = $(if (@($Cache.gpus).Count -gt 1) { "GPU $n" } else { 'GPU' }); load = $load; mem = $mem }
+        $igpu = $g.vram -le 512MB
+        $mem = if (-not $igpu) { Mem 'VRAM' ([double]$ded[$g.luid]) $g.vram } else { Mem 'Shared' ([double]$shr[$g.luid]) ($ramTotal / 2) }
+        $out += @{ name = $g.name; tag = 'GPU'; gpu = $true; igpu = $igpu; load = $load; mem = $mem }   # numbered in the UI
     }
     $out
 }
@@ -399,7 +398,7 @@ function New-Provider($name, $d) {
 }
 
 # ---------------------------------------------------------------- window
-$cfg = @{ Left = $null; Top = $null; Topmost = $false; CloseWithClaude = $true; ShowSystem = $true }
+$cfg = @{ Left = $null; Top = $null; Topmost = $false; CloseWithClaude = $true; ShowSystem = $true; HideIGpu = $false }
 if (Test-Path $ConfigPath) { try { (Get-Content $ConfigPath -Raw | ConvertFrom-Json).PSObject.Properties | ForEach-Object { $cfg[$_.Name] = $_.Value } } catch {} }
 function Save-Config { if ($Snapshot) { return }; New-Item -ItemType Directory -Force $ConfigDir | Out-Null; $cfg | ConvertTo-Json | Set-Content $ConfigPath -Encoding UTF8 }
 
@@ -437,10 +436,41 @@ $sysBody = New-Object Windows.Controls.StackPanel
 [void]$sysPanel.Children.Add($sysBody)
 $sysPanel.Visibility = if ($cfg.ShowSystem) { 'Visible' } else { 'Collapsed' }
 [void]$root.Children.Add($sysPanel)
+$sysPanel.Cursor = [Windows.Input.Cursors]::Hand
+$sysPanel.ToolTip = 'Click to open Task Manager'
 $card.Child = $root
 $win.Content = $card
 
-$win.Add_MouseLeftButtonDown({ try { $win.DragMove() } catch {} })
+# Open Task Manager unless it's already running (then just bring it forward).
+function Open-TaskManager {
+    $tm = Get-Process -Name Taskmgr -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($tm) {
+        try { Add-Type -AssemblyName Microsoft.VisualBasic; [Microsoft.VisualBasic.Interaction]::AppActivate($tm.Id) } catch {}
+    } else {
+        try { Start-Process taskmgr.exe } catch {}
+    }
+}
+
+# Left button: moving > 4 px drags the card; a plain click on the CPU / GPU section opens Task Manager.
+# The drag is done by hand (mouse capture + move by the cursor offset) rather than DragMove, whose modal
+# loop swallows the button-up and so can't tell a click from a drag.
+$script:downPt = $null; $script:dragging = $false
+$win.Add_PreviewMouseLeftButtonDown({
+    $script:downPt = $_.GetPosition($win); $script:downOnSys = $sysPanel.IsMouseOver; $script:dragging = $false
+    [void]$win.CaptureMouse()
+})
+$win.Add_PreviewMouseMove({
+    if (-not $script:downPt) { return }
+    if ($_.LeftButton -ne 'Pressed') { $script:downPt = $null; $win.ReleaseMouseCapture(); return }
+    $p = $_.GetPosition($win); $dx = $p.X - $script:downPt.X; $dy = $p.Y - $script:downPt.Y
+    if (-not $script:dragging -and ([math]::Abs($dx) -gt 4 -or [math]::Abs($dy) -gt 4)) { $script:dragging = $true }
+    if ($script:dragging) { $win.Left += $dx; $win.Top += $dy }
+})
+$win.Add_PreviewMouseLeftButtonUp({
+    $click = $script:downPt -and -not $script:dragging
+    $script:downPt = $null; $win.ReleaseMouseCapture()
+    if ($click -and $script:downOnSys -and $sysPanel.IsMouseOver) { Open-TaskManager }
+})
 $win.Add_LocationChanged({ $cfg.Left = $win.Left; $cfg.Top = $win.Top })
 $win.Add_Closing({ Save-Config })
 
@@ -459,6 +489,10 @@ function Item($header, $action, [switch]$Check, $checked) {
     $sysPanel.Visibility = if ($cfg.ShowSystem) { 'Visible' } else { 'Collapsed' }
     if ($cfg.ShowSystem) { Start-SysFetch }
 } -Check ([bool]$cfg.ShowSystem))
+[void](Item 'Hide integrated GPU' {
+    $cfg.HideIGpu = $this.IsChecked; Save-Config
+    if ($script:lastDevs) { Render-System $script:lastDevs }
+} -Check ([bool]$cfg.HideIGpu))
 [void]$menu.Items.Add((New-Object Windows.Controls.Separator))
 [void](Item 'Exit' { $win.Close() })
 $card.ContextMenu = $menu
@@ -504,7 +538,13 @@ function Start-SysFetch {
 
 function Render-System($devs) {
     $sysBody.Children.Clear()
-    foreach ($d in $devs) { if ($d) { [void]$sysBody.Children.Add((New-Device $d)) } }
+    $script:lastDevs = $devs
+    $shown = @($devs | Where-Object { $_ -and -not ($cfg.HideIGpu -and $_.igpu) })
+    $gpuCount = @($shown | Where-Object { $_.gpu }).Count; $n = 0
+    foreach ($d in $shown) {
+        if ($d.gpu) { $d.tag = if ($gpuCount -gt 1) { 'GPU ' + (++$n) } else { 'GPU' } }
+        [void]$sysBody.Children.Add((New-Device $d))
+    }
     if (-not $sysBody.Children.Count) {
         $e = Text 'No CPU / GPU readings available' 10.5 $P.Dim; $e.Margin = '14,8,0,0'
         [void]$sysBody.Children.Add($e)
@@ -529,9 +569,16 @@ $timer.Add_Tick({
     $script:lastTick = $nowTick
     if ($script:handle -and $script:handle.IsCompleted) {
         try {
-            $res = $script:ps.EndInvoke($script:handle); Render $res[0]; $script:lastOk = [DateTimeOffset]::UtcNow
-            # Claude row failed (e.g. sign-in refresh pending): retry in ~1 min instead of waiting the full interval.
-            if (-not $res[0].claude.ok -and -not $Snapshot) { $script:lastFetch = [DateTimeOffset]::UtcNow.AddSeconds(60 - $RefreshSeconds) }
+            $res = $script:ps.EndInvoke($script:handle); $data = $res[0]
+            $c = $data.claude
+            if ($c.ok) { $c.asOf = [DateTimeOffset]::UtcNow; $script:lastClaude = $c }
+            elseif ($c.err -match '\(429\)') {
+                # Rate-limited: keep showing the last good numbers ("last seen" appears after 10 min) and don't retry early.
+                if ($script:lastClaude) { $data.claude = $script:lastClaude }
+            }
+            # Other Claude failures (e.g. sign-in refresh pending): retry in ~1 min instead of the full interval.
+            elseif (-not $Snapshot) { $script:lastFetch = [DateTimeOffset]::UtcNow.AddSeconds(60 - $RefreshSeconds) }
+            Render $data; $script:lastOk = [DateTimeOffset]::UtcNow
         }
         catch { $stamp.Text = 'update failed' }
         finally { $script:ps.Dispose(); $script:handle = $null; $script:mainDone = $true; Save-SnapshotWhenReady }
