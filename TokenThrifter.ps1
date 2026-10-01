@@ -9,7 +9,8 @@
                   `claude -p /usage` hidden, which makes Claude Code refresh it (no model call).
     Z.ai        : GET api.z.ai/api/monitor/usage/quota/limit with your Z.ai API key
                   (ZAI_API_KEY, or the Z.ai token Claude Code is configured with).
-    Codex       : the latest rate_limits event Codex CLI writes to ~/.codex/sessions (no network).
+    Codex       : live from `codex app-server` (account/rateLimits/read); falls back to the latest
+                  rate_limits event Codex CLI writes to ~/.codex/sessions.
     CPU / GPU   : Windows performance counters (load, RAM, VRAM) - refreshed every 5 s.
 
   Usage:
@@ -138,24 +139,66 @@ $Fetch = {
             week = if ($w) { Win $w.percentage $w.nextResetTime } else { $null } }
     } catch { $out.zai = @{ ok = $false; err = $_.Exception.Message } }
 
-    # --- ChatGPT Codex (local session logs)
+    # --- ChatGPT Codex
     try {
-        $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
-        $dir = Join-Path $codexHome 'sessions'
-        if (-not (Test-Path $dir)) { throw 'Codex CLI not found (no ~/.codex/sessions)' }
-        $files = Get-ChildItem $dir -Recurse -Filter *.jsonl | Sort-Object LastWriteTime -Descending | Select-Object -First 10
-        $rl = $null
-        foreach ($file in $files) {
-            $m = Select-String -Path $file.FullName -Pattern '"rate_limits":\{' | Select-Object -Last 1
-            if ($m) { $j = $m.Line | ConvertFrom-Json; $rl = $j.payload.rate_limits; $asOf = ToDto $j.timestamp; break }
+        # Live: ask "codex app-server" (JSON-RPC over stdio) for account/rateLimits/read - reads the account's
+        # limits, no model call. Falls back to the last rate_limits event in the local session logs.
+        $live = $null
+        try {
+            $cx = Get-Command codex -ErrorAction SilentlyContinue | Select-Object -First 1
+            $exe = if ($cx -and $cx.Source -like '*.exe') { $cx.Source } elseif ($cx) {
+                # npm install: codex.ps1/.cmd shim -> the native binary inside the package
+                Get-ChildItem (Join-Path (Split-Path $cx.Source) 'node_modules\@openai\codex\node_modules\@openai') `
+                    -Recurse -Filter codex.exe -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName }
+            if ($exe) {
+                $psi = New-Object Diagnostics.ProcessStartInfo $exe, 'app-server'
+                $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+                $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+                # The stdin writer takes Console.InputEncoding; a UTF-8 BOM there makes app-server reject the first message.
+                $oldEnc = [Console]::InputEncoding; [Console]::InputEncoding = New-Object Text.UTF8Encoding $false
+                try { $p = [Diagnostics.Process]::Start($psi) } finally { [Console]::InputEncoding = $oldEnc }
+                try {
+                    [void]$p.StandardError.ReadToEndAsync()
+                    $p.StandardInput.Write("{`"jsonrpc`":`"2.0`",`"id`":1,`"method`":`"initialize`",`"params`":{`"clientInfo`":{`"name`":`"tokenthrifter`",`"title`":`"TokenThrifter`",`"version`":`"1.0`"}}}`n")
+                    $p.StandardInput.Flush()
+                    $deadline = [datetime]::UtcNow.AddSeconds(15); $sent = $false
+                    while (-not $live -and [datetime]::UtcNow -lt $deadline) {
+                        $t = $p.StandardOutput.ReadLineAsync()
+                        if (-not $t.Wait([int][math]::Max(1, ($deadline - [datetime]::UtcNow).TotalMilliseconds)) -or $null -eq $t.Result) { break }
+                        $msg = $t.Result | ConvertFrom-Json
+                        if ($msg.id -eq 1 -and -not $sent) {
+                            $p.StandardInput.Write("{`"jsonrpc`":`"2.0`",`"method`":`"initialized`"}`n{`"jsonrpc`":`"2.0`",`"id`":2,`"method`":`"account/rateLimits/read`"}`n")
+                            $p.StandardInput.Flush(); $sent = $true
+                        } elseif ($msg.id -eq 2) { if ($msg.result.rateLimits) { $live = $msg.result.rateLimits }; break }
+                    }
+                } finally { try { $p.StandardInput.Close() } catch {}; try { if (-not $p.WaitForExit(2000)) { $p.Kill() } } catch {} }
+            }
+        } catch {}
+        if ($live) {
+            $wins = @($live.primary, $live.secondary) | Where-Object { $_ }
+            $f = $wins | Where-Object { $_.windowDurationMins -le 300 } | Select-Object -First 1
+            $w = $wins | Where-Object { $_.windowDurationMins -gt 300 } | Select-Object -First 1
+            $out.codex = @{ ok = $true; plan = $live.planType
+                five = if ($f) { Win $f.usedPercent $f.resetsAt } else { $null }
+                week = if ($w) { Win $w.usedPercent $w.resetsAt } else { $null } }
+        } else {
+            $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
+            $dir = Join-Path $codexHome 'sessions'
+            if (-not (Test-Path $dir)) { throw 'Codex CLI not found (no ~/.codex/sessions)' }
+            $files = Get-ChildItem $dir -Recurse -Filter *.jsonl | Sort-Object LastWriteTime -Descending | Select-Object -First 10
+            $rl = $null
+            foreach ($file in $files) {
+                $m = Select-String -Path $file.FullName -Pattern '"rate_limits":\{' | Select-Object -Last 1
+                if ($m) { $j = $m.Line | ConvertFrom-Json; $rl = $j.payload.rate_limits; $asOf = ToDto $j.timestamp; break }
+            }
+            if (-not $rl) { throw 'No Codex usage recorded yet - run Codex once' }
+            $wins = @($rl.primary, $rl.secondary) | Where-Object { $_ }
+            $f = $wins | Where-Object { $_.window_minutes -le 300 } | Select-Object -First 1
+            $w = $wins | Where-Object { $_.window_minutes -gt 300 } | Select-Object -First 1
+            $out.codex = @{ ok = $true; plan = $rl.plan_type; asOf = $asOf
+                five = if ($f) { Win $f.used_percent $f.resets_at } else { $null }
+                week = if ($w) { Win $w.used_percent $w.resets_at } else { $null } }
         }
-        if (-not $rl) { throw 'No Codex usage recorded yet - run Codex once' }
-        $wins = @($rl.primary, $rl.secondary) | Where-Object { $_ }
-        $f = $wins | Where-Object { $_.window_minutes -le 300 } | Select-Object -First 1
-        $w = $wins | Where-Object { $_.window_minutes -gt 300 } | Select-Object -First 1
-        $out.codex = @{ ok = $true; plan = $rl.plan_type; asOf = $asOf
-            five = if ($f) { Win $f.used_percent $f.resets_at } else { $null }
-            week = if ($w) { Win $w.used_percent $w.resets_at } else { $null } }
     } catch { $out.codex = @{ ok = $false; err = $_.Exception.Message } }
 
     $out

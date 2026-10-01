@@ -67,7 +67,7 @@ Everything is read with credentials already on your machine; nothing is sent any
 |---|---|
 | Claude Code | `api.anthropic.com/api/oauth/usage`, using the sign-in token Claude Code keeps in `~\.claude\.credentials.json`. When that token has gone stale, TokenThrifter quietly runs `claude -p /usage` — a local command that makes Claude Code refresh its own sign-in **without a model call or any usage**. |
 | Z.ai | `api.z.ai/api/monitor/usage/quota/limit` with your Z.ai key. |
-| Codex | The rate-limit snapshot Codex CLI writes to `~\.codex\sessions\` (no network call). It updates whenever you use Codex; if it's old, the widget says "last seen …". |
+| Codex | Asks the installed Codex CLI for your live limits (`codex app-server`, the same call Codex's own `/status` uses — no model call, no usage). If that fails, it falls back to the last snapshot Codex wrote to `~\.codex\sessions\` and says "last seen …". |
 | CPU / GPU | Windows' built-in performance counters — the same ones Task Manager uses — so NVIDIA, AMD and Intel GPUs all work with nothing extra installed. |
 
 > The Claude and Z.ai usage endpoints are the ones their own apps use; they aren't formally documented and
@@ -78,7 +78,7 @@ Everything is read with credentials already on your machine; nothing is sent any
 - **Nothing appears after install** — make sure the widget isn't off-screen: delete `%APPDATA%\TokenThrifter\config.json` and run `install.ps1` again.
 - **Claude row says "Sign-in expired"** — run `claude` once in a terminal, or check `claude` is on your `PATH`.
 - **Z.ai row says "No Z.ai key found"** — set it: `setx ZAI_API_KEY "your-key"`, then restart Claude Code.
-- **Codex row says "No Codex usage recorded yet"** — run any Codex task once.
+- **Codex row says "No Codex usage recorded yet"** — check `codex` is on your `PATH` and signed in, or run any Codex task once.
 
 ## License
 

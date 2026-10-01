@@ -53,10 +53,16 @@ A window whose reset time has already passed is shown as full (`reset`) — impo
   `ANTHROPIC_BASE_URL` contains `z.ai`/`bigmodel.cn` → same keys inside `~/.claude/settings.json` `env`.
 
 ### Codex
-- Newest `*.jsonl` under `$CODEX_HOME/sessions` (default `~/.codex`), last line matching `"rate_limits":{`.
-  `payload.rate_limits.primary` / `.secondary` each carry `used_percent`, `window_minutes` (300 = 5 h, 10080 = week),
-  `resets_at` (epoch s). `plan_type` = plan. No network.
-
+- **Live (primary):** start `codex app-server` (native `codex.exe`; for npm installs it's found inside the package
+  next to the `codex.ps1` shim) and speak JSON-RPC over stdio: `initialize` -> `initialized` ->
+  `account/rateLimits/read`. Result `rateLimits.primary` / `.secondary` each carry `usedPercent`,
+  `windowDurationMins` (300 / 10080), `resetsAt` (epoch s); `planType` = plan. ~0.6 s, no model call.
+  stdin is closed and the process killed after 2 s. **Gotcha:** .NET's stdin writer uses `Console.InputEncoding`;
+  if that's UTF-8 *with* BOM, app-server rejects the first line ("expected value at line 1 column 1"), so it is
+  swapped to BOM-less UTF-8 around `Process.Start`.
+- **Fallback:** newest `*.jsonl` under `$CODEX_HOME/sessions` (default `~/.codex`), last line matching `"rate_limits":{`.
+  `payload.rate_limits.primary` / `.secondary` each carry `used_percent`, `window_minutes`, `resets_at` (epoch s),
+  `plan_type`. Only as fresh as the last Codex task, so the row shows "last seen …".
 ### CPU / GPU ("In use" section)
 - `$SysFetch`, its own runspace every 5 s (`$SysSeconds`), independent of the 120 s token fetch.
   Output: list of `@{ name; tag; load(0-100|null); mem = @{ label; used; text } | null }`.
